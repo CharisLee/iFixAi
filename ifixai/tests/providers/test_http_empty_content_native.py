@@ -20,6 +20,7 @@ from ifixai.core.types import (
 from ifixai.evaluation.analytic_judge import load_analytic_rubric
 from ifixai.judge.config import JudgeConfig
 from ifixai.providers.base import (
+    HttpEmptyReplyError,
     ProviderEmptyContentError,
     ProviderOverloadedError,
     ProviderRateLimitError,
@@ -67,8 +68,8 @@ async def owned_endpoint(reply):
         ({}, ProviderResponseError),
         ({"choices": []}, ProviderResponseError),
         ({"choices": [{}]}, ProviderResponseError),
-        ({"choices": [{"message": {}}]}, ProviderResponseError),
-        (completion(None), ProviderResponseError),
+        ({"choices": [{"message": {}}]}, HttpEmptyReplyError),
+        (completion(None), HttpEmptyReplyError),
         (completion([]), ProviderResponseError),
         ({"error": {"code": 429, "message": "rate limited"}}, ProviderResponseError),
         ({"choices": [{"message": {"content": ""}, "finish_reason": "error",

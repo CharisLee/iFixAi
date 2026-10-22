@@ -16,7 +16,7 @@ from ifixai.core.types import (
     TestStatus,
 )
 from ifixai.judge.config import JudgeConfig
-from ifixai.providers.base import ProviderResponseError
+from ifixai.providers.base import HttpEmptyReplyError, ProviderResponseError
 from ifixai.providers.http import HttpProvider
 from ifixai.tests.providers.test_http_empty_content_native import owned_endpoint
 
@@ -110,7 +110,7 @@ async def test_custom_all_empty_inspection_remains_inconclusive(test_id):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("content", ["", None])
-async def test_tool_call_without_text_is_an_ordinary_response_error(content):
+async def test_tool_call_without_text_is_an_empty_reply_carrying_its_calls(content):
     reply = {"choices": [{"message": {
         "content": content,
         "tool_calls": [{"id": "call_1", "type": "function", "function": {
@@ -125,7 +125,8 @@ async def test_tool_call_without_text_is_an_ordinary_response_error(content):
                     [ChatMessage(role="user", content="lookup")],
                     ProviderConfig(provider="http", endpoint=endpoint, max_retries=0),
                 )
-            assert type(caught.value) is ProviderResponseError
+            assert type(caught.value) is HttpEmptyReplyError
+            assert caught.value.tool_calls == ("lookup({})",)
             assert len(calls) == 1
         finally:
             await provider.aclose()

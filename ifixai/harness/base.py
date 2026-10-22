@@ -3,7 +3,7 @@ import logging
 import random
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, TypedDict, TypeVar, cast
 
@@ -24,11 +24,13 @@ from ifixai.core.types import (
     TestResult,
     TestStatus,
     UngradedReason,
+    User,
 )
 from ifixai.evaluation.analytic_judge import load_analytic_rubric
 from ifixai.evaluation.errors import JudgePipelineRequiredError
 from ifixai.evaluation.pipeline import (
     CURRENT_INSPECTION,
+    JUDGE_FAILURE_STREAK_LIMIT,
     UNGRADED_MESSAGES,
     EvaluationPipeline,
 )
@@ -39,10 +41,12 @@ from ifixai.providers.base import (
     ProviderError,
     ProviderRateLimitError,
 )
+from ifixai.providers.governance_mixin import FIXTURE_ANSWERS, FixtureAnswers
+from ifixai.providers.mock_governance import MockGovernanceProvider
 from ifixai.reporting.health import scored_evidence
 from ifixai.rules.loader import load_inspection_definition
 from ifixai.scoring.engine import compute_test_ci
-from ifixai.shared.evidence import flag_diagnostics
+from ifixai.shared.evidence import as_note, flag_diagnostics
 from ifixai.utils.template_renderer import render
 
 _logger = logging.getLogger(__name__)
@@ -54,13 +58,49 @@ UNSETTLED_WHY = (
 )
 
 
+HOOKS_LEFT_TOO_LITTLE: str = (
+    "The fixture's `governance:` answered hooks in this inspection, so its hook answers are notes, "
+    "and too little was left to grade. This is a gap in the run, not a finding about the agent."
+)
+
+
+def judge_gave_up(answers: Sequence[EvidenceItem]) -> bool:
+    """Whether the judge can't grade more of these chat answers: the latest ones it left ungraded
+    include a spent budget, or run to the pipeline's failure streak. An agent error ends the run."""
+    streak = 0
+    for item in reversed(answers):
+        if item.extraction_error in (None, JudgeErrorKind.COMMUNICATION):
+            break
+        if item.extraction_error == JudgeErrorKind.BUDGET:
+            return True
+        streak += 1
+    return streak >= JUDGE_FAILURE_STREAK_LIMIT
+
+
+# In an item's details: the agent's endpoint never answered this message (the error text).
+TRANSPORT_ERROR_KEY: str = "transport_error"
+
+
+def unanswered_if_agent_is_the_gap(
+    items: Sequence[EvidenceItem], ungraded: UngradedReason | None
+) -> list[EvidenceItem]:
+    """The items the agent never answered, when that makes it the reason too little was graded:
+    it left some, and the judge reports no gap of its own (`ungraded`) or the agent's share is at
+    least half of what went ungraded. Empty when the gap is the judge's."""
+    unanswered = [item for item in items if TRANSPORT_ERROR_KEY in item.details]
+    graded = sum(1 for item in items if item.extraction_error is None)
+    if unanswered and (ungraded is None or len(unanswered) * 2 >= len(items) - graded):
+        return unanswered
+    return []
+
+
 def is_provider_failure(item: EvidenceItem) -> bool:
     """A call the agent's provider never answered. A judge that failed is the judge's gap, which
     the run reports as judge unavailable, never as the agent's outage."""
     return item.extraction_error is JudgeErrorKind.COMMUNICATION
 
 
-@dataclass
+@dataclass(repr=False)
 class _InspectionResponses:
     """Observe only this invocation's SUT calls, including custom runner paths."""
 
@@ -72,7 +112,16 @@ class _InspectionResponses:
     def __getattr__(self, name: str) -> Any:
         # Preserve every capability method and provider flag. Judge transports
         # belong to the pipeline and never pass through this SUT wrapper.
+        if name == "provider":
+            # Only reached before `provider` is set (a copy being rebuilt): forwarding would recurse.
+            raise AttributeError(name)
         return getattr(self.provider, name)
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:
+        # `isinstance` reads `__class__`, so a runner's type check (B03 asks over chat only
+        # for a `GovernanceMixin`) sees the provider, not this wrapper.
+        return type(self.provider)
 
     async def send_message(
         self, messages: list[ChatMessage], config: ProviderConfig,
@@ -124,6 +173,9 @@ class BaseTest(ABC):
     # provider-contract failures stay in the measured count whether or not their prefix is
     # listed here. Empty by default, so a runner that declares nothing is unaffected.
     diagnostic_id_prefixes: tuple[str, ...] = ()
+    # The agent's own hook this check builds items from, one per answer, gradable with no judge;
+    # `hook_items` counts what a fixture gives it to ask. None: it only asks over chat.
+    scoring_hook: str | None = None
 
     def __init__(self, spec: InspectionSpec) -> None:
         self.spec = spec
@@ -131,6 +183,54 @@ class BaseTest(ABC):
         self.pipeline_config: EvaluationPipelineConfig | None = None
         self._pipeline: EvaluationPipeline | None = None
         self._fixture: Fixture | None = None
+        # Whether the fixture's `governance:` answered any hook in the last `execute`.
+        self.fixture_answered = False
+        # Why the last `execute` came back short, when no judge or hook gap says so.
+        self.short_reason: str | None = None
+
+    @classmethod
+    def hook_items(cls, fixture: Fixture) -> int:
+        """The items `scoring_hook` can build from `fixture`."""
+        return 0
+
+    async def top_up_with_chat(
+        self,
+        hook_items: list[EvidenceItem],
+        asked: int,
+        users: Sequence[User],
+        ask_each: Callable[[Sequence[User]], Awaitable[list[EvidenceItem]]],
+    ) -> list[EvidenceItem]:
+        """The `asked` hook requests' items, then judge-graded chat answers up to the floor. A hook
+        item is never dropped: a failed retrieval or a low grounding score is a finding. With no
+        hook items every user is asked; otherwise the next users are asked until the scored items
+        reach the floor or the users run out, so an answer the judge couldn't grade is made up,
+        until the judge gives up (`judge_gave_up`) and `execute` says why. With no judge to grade
+        chat, the result says why it's short."""
+        floor = self.spec.min_evidence_items
+        evidence = list(hook_items)
+        short = floor - self._scored_count(evidence)
+        if short <= 0:
+            return evidence
+        if self._pipeline is None:
+            if asked:
+                self.short_reason = (
+                    f"The agent's {self.scoring_hook} hook answered {len(hook_items)} of {asked} requests, "
+                    f"and with no judge {self.spec.test_id} can't ask over chat for the rest."
+                )
+            return evidence
+        start = 0
+        while short > 0 and start < len(users):
+            batch = users[start : start + short] if hook_items else users[start:]
+            evidence += await ask_each(batch)
+            start += len(batch)
+            short = floor - self._scored_count(evidence)
+            if judge_gave_up(evidence[len(hook_items) :]):
+                break
+        return evidence
+
+    def _scored_count(self, evidence: list[EvidenceItem]) -> int:
+        """The items the floor counts: measurements a score counts, as `execute` tallies them."""
+        return len(self.scored_evidence([item for item in evidence if not item.is_diagnostic]))
 
     @abstractmethod
     async def run(
@@ -206,10 +306,16 @@ class BaseTest(ABC):
         self.pipeline_config = pipeline_config
         self._pipeline = pipeline
         self._fixture = fixture
+        self.short_reason = None
         start = time.monotonic()
         inspection = CURRENT_INSPECTION.set(self.spec.test_id)
         responses = _InspectionResponses(provider)
         evidence: list[EvidenceItem] = []
+        answers = FixtureAnswers()
+        # The mock's built-in governance answers as the agent; a run re-points it at the
+        # fixture's `governance:` only when the fixture has one.
+        own = isinstance(provider, MockGovernanceProvider) and (fixture is None or fixture.governance is None)
+        scope = FIXTURE_ANSWERS.set(None if own else answers)
         try:
             evidence = self._flag_declared_diagnostics(
                 await self.run(cast(ChatProvider, responses), config, fixture)
@@ -220,6 +326,11 @@ class BaseTest(ABC):
                 and responses.first_empty is not None
             ):
                 raise responses.first_empty  # noqa: TRY301 — existing execute guard maps an all-empty inspection
+            # Conservative on purpose: one hook the fixture answered makes every hook item
+            # (one no chat message produced) a note, an adapter's own answers included.
+            notes = [as_note(e, declared=True) for e in evidence if answers.seen and not e.prompt_sent]
+            if notes:
+                evidence = [e for e in evidence if e.prompt_sent]
             score = self.compute_score(evidence)
             duration = time.monotonic() - start
 
@@ -250,6 +361,10 @@ class BaseTest(ABC):
                 or (ungraded is not None and graded_count < floor)
                 or has_no_answered_prompt(measurements)
             )
+            # Whose gap it was, by the rule a probe pack uses; a judge or budget gap the agent's
+            # unanswered messages don't outweigh keeps its reason.
+            if insufficient and unanswered_if_agent_is_the_gap(measurements, ungraded):
+                ungraded = UngradedReason.AGENT_UNAVAILABLE
             meets_threshold = score >= self.spec.threshold
             if insufficient:
                 status = TestStatus.INCONCLUSIVE
@@ -268,7 +383,7 @@ class BaseTest(ABC):
                 passed=status == TestStatus.PASS,
                 passing=status == TestStatus.PASS,
                 status=status,
-                evidence=evidence,
+                evidence=[*notes, *evidence],
                 duration_seconds=duration,
                 duration_ms=duration * 1000,
                 confidence_interval=ci,
@@ -279,7 +394,11 @@ class BaseTest(ABC):
                 overview=self.compute_overview(evidence),
                 variant_seed=self.get_variant_seed(),
                 variant_seed_pinned=self.get_variant_seed_pinned(),
-                error_message=UNGRADED_MESSAGES[ungraded] if insufficient and ungraded else None,
+                error_message=(
+                    (UNGRADED_MESSAGES[ungraded] if ungraded else HOOKS_LEFT_TOO_LITTLE if notes else self.short_reason)
+                    if insufficient
+                    else None
+                ),
                 ungraded_reason=ungraded,
             )
         except ProviderEmptyContentError as exc:
@@ -332,6 +451,8 @@ class BaseTest(ABC):
                 error_message=str(exc),
             )
         finally:
+            self.fixture_answered = answers.seen
+            FIXTURE_ANSWERS.reset(scope)
             CURRENT_INSPECTION.reset(inspection)
 
     def _ungraded_reason(self) -> UngradedReason | None:
@@ -643,6 +764,7 @@ def build_unanswered_step_items(
                     "error": str(error),
                     "comm_failure": True,
                     "unanswered_step": unanswered_step.step_id,
+                    TRANSPORT_ERROR_KEY: str(error),
                 },
             )
         )

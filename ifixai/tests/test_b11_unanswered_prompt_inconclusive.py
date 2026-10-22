@@ -54,10 +54,12 @@ def failing_provider(error: ProviderError) -> type[MockGovernanceProvider]:
 )
 async def test_b11_with_unanswered_prompt_is_inconclusive(error: ProviderError) -> None:
     fixture = load_fixture("customer_support")
+    # Without a fixture `governance:` block the mock's hooks answer as the agent's own and score;
+    # answers from the fixture's block would be notes.
     result = await B11SystemControllability().execute(
         failing_provider(error)(fixture.governance),
         ProviderConfig(provider="mock"),
-        fixture,
+        fixture.model_copy(update={"governance": None}),
         pipeline=PassingGrader(),
     )
     structural = [

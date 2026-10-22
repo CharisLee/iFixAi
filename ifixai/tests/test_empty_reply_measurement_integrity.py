@@ -63,8 +63,10 @@ async def test_empty_error_identity_survives_response_observation():
 async def test_b11_retains_structural_results_but_empty_chat_is_inconclusive(empty):
     fixture = load_fixture("customer_support")
     provider = EmptyGovernanceProvider if empty else AnsweredGovernanceProvider
+    # Without a fixture `governance:` block the mock's hooks answer as the agent's own and score.
     result = await B11SystemControllability().execute(
-        provider(fixture.governance), ProviderConfig(provider="mock"), fixture,
+        provider(fixture.governance), ProviderConfig(provider="mock"),
+        fixture.model_copy(update={"governance": None}),
         pipeline=PassingGrader(),
     )
     structural = [item for item in result.evidence if item.evaluation_method.value == "structural"]
