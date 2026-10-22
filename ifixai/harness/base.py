@@ -5,25 +5,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypedDict, TypeVar, cast
-
-from ifixai.evaluation.analytic_judge import load_analytic_rubric
-from ifixai.evaluation.errors import JudgePipelineRequiredError
-from ifixai.providers.base import (
-    ChatProvider,
-    ProviderEmptyContentError,
-    ProviderEmptyProbeError,
-    ProviderError,
-    ProviderRateLimitError,
-)
-from ifixai.reporting.health import measured_count, scored_evidence
-from ifixai.rules.loader import load_inspection_definition
-from ifixai.scoring.engine import compute_test_ci
-from ifixai.shared.evidence import flag_diagnostics
-from ifixai.utils.template_renderer import render
-
-if TYPE_CHECKING:
-    from ifixai.evaluation.pipeline import EvaluationPipeline
+from typing import Any, TypedDict, TypeVar, cast
 
 from ifixai.core.types import (
     AnalyticRubric,
@@ -41,7 +23,27 @@ from ifixai.core.types import (
     ScoreBreakdown,
     TestResult,
     TestStatus,
+    UngradedReason,
 )
+from ifixai.evaluation.analytic_judge import load_analytic_rubric
+from ifixai.evaluation.errors import JudgePipelineRequiredError
+from ifixai.evaluation.pipeline import (
+    CURRENT_INSPECTION,
+    UNGRADED_MESSAGES,
+    EvaluationPipeline,
+)
+from ifixai.providers.base import (
+    ChatProvider,
+    ProviderEmptyContentError,
+    ProviderEmptyProbeError,
+    ProviderError,
+    ProviderRateLimitError,
+)
+from ifixai.reporting.health import scored_evidence
+from ifixai.rules.loader import load_inspection_definition
+from ifixai.scoring.engine import compute_test_ci
+from ifixai.shared.evidence import flag_diagnostics
+from ifixai.utils.template_renderer import render
 
 _logger = logging.getLogger(__name__)
 
@@ -53,12 +55,9 @@ UNSETTLED_WHY = (
 
 
 def is_provider_failure(item: EvidenceItem) -> bool:
-    """A call the agent's provider never answered, or a judge rejected outright.
-    A judge that only timed out on an item is not one."""
-    return item.extraction_error in (
-        JudgeErrorKind.COMMUNICATION,
-        JudgeErrorKind.JUDGE_UNREACHABLE,
-    )
+    """A call the agent's provider never answered. A judge that failed is the judge's gap, which
+    the run reports as judge unavailable, never as the agent's outage."""
+    return item.extraction_error is JudgeErrorKind.COMMUNICATION
 
 
 @dataclass
@@ -182,6 +181,10 @@ class BaseTest(ABC):
         upward. `docs/scoring.md` § Noise tells readers to compare runs by CI overlap, so
         the two must measure the same thing.
         """
+        return self.scored_evidence(evidence)
+
+    def scored_evidence(self, evidence: list[EvidenceItem]) -> list[EvidenceItem]:
+        """The items a score counts (see `counts_toward_score`)."""
         return scored_evidence(evidence, self.spec.count_extraction_errors_as_fail)
 
     def get_variant_seed(self) -> int | None:
@@ -204,6 +207,7 @@ class BaseTest(ABC):
         self._pipeline = pipeline
         self._fixture = fixture
         start = time.monotonic()
+        inspection = CURRENT_INSPECTION.set(self.spec.test_id)
         responses = _InspectionResponses(provider)
         evidence: list[EvidenceItem] = []
         try:
@@ -233,14 +237,17 @@ class BaseTest(ABC):
             # excludes them, and a floor cleared by items the score ignores means the two
             # disagree on the denominator.
             measurements = [e for e in evidence if not e.is_diagnostic]
-            scoreable_count = measured_count(
-                measurements, self.spec.count_extraction_errors_as_fail
-            )
-            # An agent that answered no prompt at all gave the inspection nothing to
-            # grade. API-level items that need no reply may still clear the floor
-            # (B13 needs one), and would otherwise report a PASS the agent never earned.
+            scoreable_count = len(self.scored_evidence(measurements))
+            graded_count = sum(1 for e in measurements if e.extraction_error is None)
+            ungraded = self._ungraded_reason()
+            # A judge gap leaves it INCONCLUSIVE only below the floor: with enough graded
+            # probes the score stands on them, whatever the judge did to the rest. An agent
+            # that answered no prompt at all gave nothing to grade, whatever API-level items
+            # cleared the floor (B13 needs one), so that is never a PASS it earned.
+            floor = self.spec.min_evidence_items
             insufficient = (
-                scoreable_count < self.spec.min_evidence_items
+                scoreable_count < floor
+                or (ungraded is not None and graded_count < floor)
                 or has_no_answered_prompt(measurements)
             )
             meets_threshold = score >= self.spec.threshold
@@ -272,6 +279,8 @@ class BaseTest(ABC):
                 overview=self.compute_overview(evidence),
                 variant_seed=self.get_variant_seed(),
                 variant_seed_pinned=self.get_variant_seed_pinned(),
+                error_message=UNGRADED_MESSAGES[ungraded] if insufficient and ungraded else None,
+                ungraded_reason=ungraded,
             )
         except ProviderEmptyContentError as exc:
             empty_error = (
@@ -322,6 +331,15 @@ class BaseTest(ABC):
                 error=str(exc),
                 error_message=str(exc),
             )
+        finally:
+            CURRENT_INSPECTION.reset(inspection)
+
+    def _ungraded_reason(self) -> UngradedReason | None:
+        """Why the judge left some of this inspection's probes ungraded (see
+        `EvaluationPipeline.ungraded_reason`)."""
+        if not isinstance(self._pipeline, EvaluationPipeline):
+            return None
+        return self._pipeline.ungraded_reason(self.spec.test_id)
 
     def load_inspection_data(self) -> ConversationPlan | None:
         plan = load_inspection_definition(self.spec.test_id)
@@ -333,7 +351,7 @@ class BaseTest(ABC):
         return plan
 
     def compute_score(self, evidence: list[EvidenceItem]) -> float:
-        scored = scored_evidence(evidence, self.spec.count_extraction_errors_as_fail)
+        scored = self.scored_evidence(evidence)
         if not scored:
             return 0.0
         total = sum(
@@ -353,7 +371,7 @@ class BaseTest(ABC):
         a correct response below threshold. Judge extraction-errors are excluded
         (-> INCONCLUSIVE) unless the spec counts them as failures.
         """
-        scored = scored_evidence(evidence, self.spec.count_extraction_errors_as_fail)
+        scored = self.scored_evidence(evidence)
         if not scored:
             return 0.0
         return sum(1.0 for e in scored if e.passed) / len(scored)

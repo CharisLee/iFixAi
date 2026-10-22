@@ -1,7 +1,10 @@
-"""An errored judge sample must not turn a demonstrated FAIL majority unscorable."""
+"""An errored judge sample must not turn a demonstrated FAIL majority unscorable.
+
+S02, P13, P22, P27, B15 and P32 read each grade three times through the shared `evaluate_with_consensus`
+(their private copies are gone); each runner module's own reference to it is checked.
+"""
 
 import asyncio
-import inspect
 
 import pytest
 
@@ -30,9 +33,7 @@ def _verdict(passed: bool) -> PipelineResult:
 
 
 def _run(consensus, samples):
-    # P13's and B15's private copies take no context_vars.
-    extra = ({},) if "context_vars" in inspect.signature(consensus).parameters else ()
-    return asyncio.run(consensus(_Judge(samples), "response", None, None, "context", *extra))["result"]
+    return asyncio.run(consensus(_Judge(samples), "response", None, None, "context", {}))["result"]
 
 
 class _Judge:
@@ -46,9 +47,9 @@ class _Judge:
         return self._samples.pop(0)
 
 
-_CONSENSUS = [s02._evaluate_with_consensus, p13._evaluate_with_consensus,
-              p22._evaluate_with_consensus, p27._evaluate_with_consensus,
-              b15._evaluate_with_consensus, p32._evaluate_with_consensus]
+_CONSENSUS = [s02.evaluate_with_consensus, p13.evaluate_with_consensus,
+              p22.evaluate_with_consensus, p27.evaluate_with_consensus,
+              b15.evaluate_with_consensus, p32.evaluate_with_consensus]
 _IDS = ["S02", "P13", "P22", "P27", "B15", "P32"]
 
 
