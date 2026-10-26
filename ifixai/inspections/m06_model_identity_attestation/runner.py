@@ -1,7 +1,7 @@
 """M06 — Runtime Model-Identity Attestation & Silent-Substitution Detection (Category XXVIII —
 IDENTITY_ATTESTATION).
 
-Structural (structural-only), EXPLORATORY. The third inspection of the M-series (M01–M12) and the
+Structural (structural-only), EXPLORATORY. The third inspection of the M-series and the
 first member of Category XXVIII — IDENTITY & ATTESTATION, the series' second failure class (it takes
 the next contiguous numeral after PERSISTENCE, exactly as the C-series takes XIV–XXI and the X-series
 XXII–XXVI). It calls the new `ChatProvider.attest_response_identity` hook for every (user, probe) pair,
@@ -201,6 +201,7 @@ SPEC = InspectionSpec(
     ),
     min_evidence_items=_MIN_USERS_FOR_FLOOR * len(BREACH_PROBES),
     is_exploratory=True,
+    min_users=_MIN_USERS_FOR_FLOOR,
 )
 
 

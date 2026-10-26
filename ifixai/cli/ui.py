@@ -15,7 +15,14 @@ from functools import lru_cache
 import click
 
 from ifixai.cli._branding import supports_color
-from ifixai.reporting.scorecard import absent_score_reason, compute_insights
+from ifixai.reporting.scorecard import (
+    absent_score_reason,
+    compute_insights,
+    pass_mark_note,
+    run_verdict,
+    run_verdict_label,
+)
+from ifixai.scoring.engine import is_unscored
 
 _ACCENT = "rgb(232,99,42)"
 _DIM = "grey62"
@@ -209,6 +216,10 @@ def table(title: str, columns: Sequence[str], rows: Sequence[Sequence[str]]) -> 
     return True
 
 
+# The color of each run verdict, on the styled card and the plain terminal summary.
+VERDICT_COLORS: dict[str, str] = {"PASS": "green", "FAIL": "red", "ERROR": "red", "INCONCLUSIVE": "yellow"}
+
+
 def _score_style(score: float) -> str:
     if score >= 0.9:
         return "bold green"
@@ -230,10 +241,6 @@ def _grade_color(grade: str) -> str:
 def _bar(ratio: float, width: int = 18) -> str:
     filled = max(0, min(width, round(ratio * width)))
     return "█" * filled + "·" * (width - filled)
-
-
-def _verdict_style(passed: bool) -> str:
-    return "bold white on green" if passed else "bold white on red"
 
 
 def _row_style(score: float | None) -> str:
@@ -266,9 +273,11 @@ def render_scorecard(result) -> bool:
 
     overall = ins["overall_score"]
     self_judged = ins["self_judged"]
+    verdict_label = run_verdict_label(result) + pass_mark_note(result)
+    verdict_color = VERDICT_COLORS[run_verdict(result)]
     if overall is None:
         result_body = Text(justify="center")
-        result_body.append("n/a\n\n", style="bold yellow")
+        result_body.append(f"{verdict_label}\n\n", style=f"bold {verdict_color}")
         reason = absent_score_reason(result)
         result_body.append(reason[:1].upper() + reason[1:], style=_DIM)
         if self_judged:
@@ -290,10 +299,6 @@ def render_scorecard(result) -> bool:
         # A self-judged run still prints its grade, flagged as biased / not citable.
         grade = ins["grade"]
         gcolor = _grade_color(grade)
-        passed = ins["passed"]
-        verdict_label = "PASS" if passed else "FAIL"
-        verdict_color = "green" if passed else "red"
-
         grade_txt = Text(f"  {grade}  ", style=f"bold white on {gcolor}", justify="center")
         verdict_txt = Text(f"  {verdict_label}  ", style=f"bold white on {verdict_color}", justify="center")
 
@@ -382,10 +387,13 @@ def render_scorecard(result) -> bool:
         t.add_column("Result", justify="center", min_width=16)
         return t
 
+    not_scored_ids = {r.test_id for r in result.test_results if is_unscored(r)}
+
     def _scorecard_row(t: Table, idx: int, cs) -> None:
         total_in_suite = len(cs.test_ids)
         failed = cs.test_count - cs.tests_passed
-        inconclusive = total_in_suite - cs.test_count
+        not_scored = sum(1 for test_id in cs.test_ids if test_id in not_scored_ids)
+        inconclusive = total_in_suite - cs.test_count - not_scored
         ratio = cs.tests_passed / total_in_suite if total_in_suite else 0.0
         row_style = _row_style(cs.score)
         score_txt = Text(
@@ -404,10 +412,10 @@ def render_scorecard(result) -> bool:
         # The ✓/✗/⊘ icons still convey pass / fail / inconclusive.
         if cs.score is None:
             result_txt = Text("⊘  not scored", style="yellow", justify="center")
-        elif failed == 0 and inconclusive == 0:
+        elif failed == 0 and inconclusive == 0 and not_scored == 0:
             result_txt = Text("✓  all passed", style=f"bold {row_style}", justify="center")
         else:
-            # Show failures AND inconclusives so passed + failed + inconclusive = total.
+            # Show failures, inconclusives and unscored ones so they add up to the total.
             result_txt = Text(justify="center")
             if failed > 0:
                 result_txt.append(f"✗ {failed} failed", style=f"bold {row_style}")
@@ -415,6 +423,9 @@ def render_scorecard(result) -> bool:
                 result_txt.append("   ")
             if inconclusive > 0:
                 result_txt.append(f"⊘ {inconclusive} inconclusive", style=row_style)
+            if not_scored > 0:
+                result_txt.append("   " if failed or inconclusive else "")
+                result_txt.append(f"{not_scored} not scored", style=row_style)
         t.add_row(str(idx), cs.category.value, score_txt, bar_txt, tests_txt, result_txt)
 
     core_tbl = _scorecard_table(
@@ -528,6 +539,12 @@ def render_scorecard(result) -> bool:
         expl_tbl.add_column("Score", justify="right", width=8)
         expl_tbl.add_column("Signal", justify="center", width=8)
         for item in ins["exploratory"]:
+            # A findings-only result has no score or pass mark; its findings print below.
+            if item.get("findings_only"):
+                expl_tbl.add_row(
+                    item["test_id"], item["name"], Text("report only", style=_DIM), Text("—", style=_DIM)
+                )
+                continue
             mark = Text("✓", style="green") if item["passing"] else Text("·", style=_DIM)
             expl_tbl.add_row(
                 item["test_id"],

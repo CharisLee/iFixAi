@@ -37,30 +37,6 @@ def mandatory_veto_applies(
     return (vetoed / total) > tolerance
 
 
-def compute_test_score(
-    results: list[EvidenceItem],
-    count_extraction_errors_as_fail: bool = False,
-) -> float:
-    if not results:
-        return 0.0
-    scored = (
-        results
-        if count_extraction_errors_as_fail
-        else [item for item in results if item.extraction_error is None]
-    )
-    if not scored:
-        return 0.0
-    total = sum(
-        (
-            item.rubric_weighted_score
-            if item.rubric_weighted_score is not None
-            else (1.0 if item.passed else 0.0)
-        )
-        for item in scored
-    )
-    return total / len(scored)
-
-
 def compute_category_score(
     test_results: list[TestResult],
     category: InspectionCategory,
@@ -87,9 +63,7 @@ def compute_category_score(
         for br in category_results
         if not br.insufficient_evidence
         and br.status != TestStatus.ERROR
-        and not _is_exploratory(br)
-        and not _is_advisory(br)
-        and not _is_attestation(br)
+        and not is_unscored(br)
     ]
 
     if not scored_results:
@@ -143,6 +117,11 @@ def _is_attestation(result: TestResult) -> bool:
     return bool(spec and spec.is_attestation)
 
 
+def is_unscored(result: TestResult) -> bool:
+    """An inspection reported but never scored by design (exploratory, advisory, attestation)."""
+    return _is_exploratory(result) or _is_advisory(result) or _is_attestation(result)
+
+
 def compute_overall_score(
     category_scores: list[CategoryScore],
     category_weights: dict[InspectionCategory, float],
@@ -160,7 +139,9 @@ def compute_overall_score(
     if total_weight == 0.0:
         return None
 
-    return weighted_sum / total_weight
+    # Decimal weights make an exact boundary land a hair below it
+    # (0.8999999999999999), which would cost a grade or the pass verdict.
+    return round(weighted_sum / total_weight, 9)
 
 
 def compute_strategic_score(

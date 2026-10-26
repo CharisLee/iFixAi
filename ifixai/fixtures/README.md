@@ -1,27 +1,26 @@
 # Writing a Fixture
 
-A fixture is the YAML (or JSON) file that tells ifixai **what system it is testing** — the roles, tools, permissions, data sources, policies, regulations, and domain-specific prompts that the 60 inspections (the `B01`–`B32` core plus 18 extended P / C / S / X / M inspections) parameterize against.
+A fixture is the YAML (or JSON) file that tells ifixai **what system it is testing** — the roles, tools, permissions, data sources, policies, regulations, and domain-specific prompts that the 61 inspections (32 `B01`–`B32` core plus 29 extended P / C / S / X / M / V inspections) parameterize against.
 
 This directory contains:
 
 - [`schema.json`](schema.json) — the authoritative JSON Schema (Draft-07) every fixture is validated against.
-- [`default/fixture.yaml`](default/fixture.yaml) — the fallback used by `--mode standard` when no fixture is supplied. Mirrors [`examples/nimbusforge_it_infra.yaml`](examples/nimbusforge_it_infra.yaml): full 50-inspection coverage **with seeded defects**, so an out-of-the-box mock run demonstrates failures — see [`default/README.md`](default/README.md).
-- [`examples/`](examples/) — illustrative fixtures (`healthcare.yaml`, `software_engineering.yaml`, `customer_support.yaml`). Copy one of these as a starting point.
+- [`default/fixture.yaml`](default/fixture.yaml) — the fallback used by `--mode standard` when no fixture is supplied. Its parsed data matches [`examples/nimbusforge_it_infra.yaml`](examples/nimbusforge_it_infra.yaml); it provides evidence for all 61 inspections and includes seeded defects so an out-of-the-box mock full-suite run demonstrates failures. See [`default/README.md`](default/README.md).
+- [`examples/`](examples/) — illustrative fixtures for different domains and coverage needs. Choose one suited to your use case.
 - [`smoke_tiny.yaml`](smoke_tiny.yaml) — minimal fixture used by the smoke test.
 
 Loader and validator live in [`../core/fixture_loader.py`](../core/fixture_loader.py).
 
 ## Optional `governance:` block
 
-To score governance inspections against a real provider without writing
-Python, declare your control plane on the diagnostic fixture itself.
-Three shapes are supported:
+To set the rules the probes test without writing Python, declare your
+control plane on the diagnostic fixture itself. Two shapes are supported:
 
 > **Per-inspection structural requirements** (which fields each of B02 /
 > B04 / B11 / B23 / B26 / B27 reads and what makes them pass) live in
 > [`docs/fixture_authoring.md`](../../docs/fixture_authoring.md). Read
-> that page when an inspection reports `insufficient_evidence` and you
-> need to know which YAML field to add.
+> that page when an inspection reports INCONCLUSIVE or is listed as not
+> applicable and you need to know which YAML field to add.
 
 ```yaml
 # 1. Full inline block — best for hand-authored fixtures
@@ -49,10 +48,10 @@ governance:
   synthesize: true
 ```
 
-When neither is present and `--governance <path>` is not supplied,
-governance inspections will return `insufficient_evidence` (the honest
-answer for a vanilla LLM). See `Wiring Governance` in the top-level
-README and `docs/methodology.md` for the trade-off discussion.
+Neither is required. The block never earns a pass: with or without it,
+every inspection with a chat probe asks the agent and its replies decide
+the verdict. See
+[`docs/testing-your-agent.md`](../../docs/testing-your-agent.md#no-code-declare-governance-in-the-fixture).
 
 `seed_audit_records` (full-block form only) pre-stamps the audit log so
 B23 (Policy Version Traceability) is self-contained and no longer
@@ -64,17 +63,14 @@ Trail Integrity, Category VII — SUBVERSION)**: P08 drives the fixture's
 `(role, tool)` actions and cross-checks the emitted audit records against
 the action it observed, for suppression / field-alteration / timestamp-
 reordering / post-hoc-mutation. Every shipped example exercises P08 and
-scores `1.0` against the honest governance reference (locked by
-`tests/unittesting/inspections/p08_self_audit_trail_integrity/test_shipped_fixtures.py`).
-Set `policies.audit_logging: disabled` to mark P08 not-applicable for a
-deployment that keeps no audit log.
+scores `1.0` against the honest governance reference in a mock-provider run. This has been exercised against all shipped example fixtures. Set `policies.audit_logging: disabled` to mark P08 not-applicable for a deployment that keeps no audit log.
 
 ## Capability hooks for the extended (P / C / S / X / M / V) inspections
 
-The 28 premium / exploratory inspections beyond the `B01`–`B32` core mostly read **provider
-capability hooks**, not new fixture fields — so a vanilla LLM reports `insufficient_evidence` for
-them (the honest answer) while a hook-exposing provider (including `--provider mock`) scores them.
-Their only fixture touchpoints:
+The 29 premium / exploratory inspections beyond the `B01` to `B32` core send their probes over chat,
+so a bare model or HTTP agent is graded too. The provider hooks below show as notes beside the
+probe results and never change the verdict; M06, which has no chat probe, is not applicable
+without its hook. Their only fixture touchpoints:
 
 | Inspection(s) | Provider hook it calls | Fixture field it reads |
 |---|---|---|
@@ -87,6 +83,7 @@ Their only fixture touchpoints:
 | V08 | `screen_training_specification` | `users` — the runner-authored specification catalogue ships with the inspection |
 | V01–V07 / V09 | judge-path (no capability hook) | `users` + `metadata.domain` — frozen case catalogues ship with each inspection |
 | V10 | judge-path (no capability hook) | `users` — the frozen case catalogue ships with the inspection |
+| V11 | judge-path (no capability hook) | `users` — the forty frozen four-turn chats ship with the inspection |
 
 Full per-inspection descriptions:
 [`docs/inspections.md`](../../docs/inspections.md).

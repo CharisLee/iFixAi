@@ -23,6 +23,7 @@ from ifixai.core.types import (
     RubricVerdict,
     TestStatus,
     ToolInvocationResult,
+    UngradedReason,
 )
 from ifixai.evaluation.analytic_judge import (
     JudgeExtractionError,
@@ -140,7 +141,10 @@ async def test_b08_with_every_judge_item_unscored_is_inconclusive(monkeypatch: p
         )
     b08 = run.test_results[0]
     judged = [e for e in b08.evidence if e.evaluation_method is EvaluationMethod.JUDGE]
-    assert judged and all(e.extraction_error is JudgeErrorKind.JUDGE_UNREACHABLE for e in judged)
+    # Rejected calls, then calls the breaker skips once the judge is down for B08.
+    assert judged and {e.extraction_error for e in judged} <= {
+        JudgeErrorKind.JUDGE_UNREACHABLE, JudgeErrorKind.UNAVAILABLE,
+    }
     assert any(e.evaluation_method is EvaluationMethod.STRUCTURAL for e in b08.evidence)
     assert b08.status is TestStatus.INCONCLUSIVE
 
@@ -162,8 +166,9 @@ class FirstCallsJudge:
         return parse_rubric_verdict(json.dumps({"dimensions": dims}), rubric)
 
 
-async def test_b08_floor_counts_tool_checks() -> None:
-    # 9 graded judge items are under the 10-item floor; the tool checks clear it.
+async def test_b08_floor_never_counts_declared_tool_checks() -> None:
+    # 9 graded judge items are under the 10-item floor. The tool checks answer from the mock's
+    # declared governance, so they are notes and never clear it.
     result = await B08PrivilegeEscalation().execute(
         resolve_provider("mock"), ProviderConfig(provider="mock", api_key="x"), load_fixture("default"),
         capabilities=ProviderCapabilities(has_tool_calling=True),
@@ -172,8 +177,9 @@ async def test_b08_floor_counts_tool_checks() -> None:
     judged = [e for e in result.evidence if e.evaluation_method is EvaluationMethod.JUDGE]
     graded = [e for e in judged if e.extraction_error is None]
     assert (len(graded), len(judged) > len(graded)) == (9, True)
-    assert any(e.evaluation_method is EvaluationMethod.STRUCTURAL for e in result.evidence)
-    assert (result.status, result.score) == (TestStatus.PASS, 1.0)
+    structural = [e for e in result.evidence if e.evaluation_method is EvaluationMethod.STRUCTURAL]
+    assert structural and all(e.is_diagnostic for e in structural)
+    assert result.status is TestStatus.INCONCLUSIVE
 
 
 async def test_b08_structural_escalation_shows_as_fail() -> None:
@@ -233,7 +239,8 @@ async def test_b27_counts_a_reply_too_long_to_grade_as_a_fail() -> None:
     ("kind", "expected"),
     [
         (JudgeErrorKind.COMMUNICATION, True),
-        (JudgeErrorKind.JUDGE_UNREACHABLE, True),
+        (JudgeErrorKind.JUDGE_UNREACHABLE, False),
+        (JudgeErrorKind.UNAVAILABLE, False),
         (JudgeErrorKind.JUDGE_TRANSIENT, False),
         (JudgeErrorKind.EXTRACTION, False),
         (JudgeErrorKind.CONTRACT, False),
@@ -241,19 +248,13 @@ async def test_b27_counts_a_reply_too_long_to_grade_as_a_fail() -> None:
         (None, False),
     ],
 )
-def test_a_provider_failure_is_either_side_never_answering(kind: JudgeErrorKind | None, expected: bool) -> None:
+def test_a_provider_failure_is_only_the_agent_never_answering(kind: JudgeErrorKind | None, expected: bool) -> None:
     assert is_provider_failure(EvidenceItem(test_case_id="x", passed=False, extraction_error=kind)) is expected
 
 
-@pytest.mark.parametrize(
-    ("test_id", "message"),
-    [
-        ("M12", "M12: all arcs failed at provider level"),
-        *[(tid, f"{tid}: all probes failed at provider level") for tid in ("V02", "V03", "V04", "V05", "V06", "V07", "V09")],
-    ],
-)
-async def test_a_dead_judge_reads_as_a_provider_outage(
-    monkeypatch: pytest.MonkeyPatch, test_id: str, message: str
+@pytest.mark.parametrize("test_id", ["M12", "V02", "V03", "V04", "V05", "V06", "V07", "V09"])
+async def test_a_dead_judge_reads_as_judge_unavailable_not_a_provider_outage(
+    monkeypatch: pytest.MonkeyPatch, test_id: str
 ) -> None:
     monkeypatch.setenv("IFIXAI_JUDGE_FAIL_FAST", "0")
     async with _serve(_reject) as endpoint:
@@ -264,8 +265,8 @@ async def test_a_dead_judge_reads_as_a_provider_outage(
         )
     result = run.test_results[0]
     assert result.status is TestStatus.INCONCLUSIVE
-    assert message in (result.error or "")
-    assert result.evidence == []
+    assert result.ungraded_reason is UngradedReason.JUDGE_UNAVAILABLE
+    assert "failed at provider level" not in (result.error or "")
 
 
 async def _cut_off(_request: web.Request) -> web.Response:

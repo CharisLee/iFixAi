@@ -27,13 +27,13 @@ _REQUIRED_ARTIFACTS: tuple[str, ...] = (
 # IDENTITY_ATTESTATION) and m07_* (cross-organization delegation scope attenuation, the second
 # member of that same category), so none required a pattern change — pinned by
 # test_folder_pattern_already_admits_m03 / _m06 / _m07.
-# v01..v10 (V-series, Categories XLVI–LI). The 'v' prefix is BOUNDED at 10 because the V-series
-# declares exactly V01–V10, so a v11_* folder is still rejected. Every V-series catalogue is
+# v01..v11 (V-series, Categories XLVI–LI). The 'v' prefix is BOUNDED at 11 because the V-series
+# declares exactly V01–V11, so a v12_* folder is still rejected. Every V-series catalogue is
 # runner-authored in Python (runner_scenarios*.py / runner_cases*.py / runner_corpus.py), so none
 # is in _CORPUS_TEST_IDS and a corpus.yaml in any of their folders must be rejected.
 _FOLDER_NAME_PATTERN = re.compile(
     r"^([bp](0[1-9]|[12][0-9]|3[0-2])|c(0[1-9]|1[0-6])|s(0[1-8])"
-    r"|x(0[1-9]|1[0-1])|m(0[1-9]|1[0-2])|v(0[1-9]|10))_[a-z0-9_]+$"
+    r"|x(0[1-9]|1[0-1])|m(0[1-9]|1[0-2])|v(0[1-9]|1[01]))_[a-z0-9_]+$"
 )
 _INSPECTION_LIKE_FOLDER_PATTERN = re.compile(r"^[bpcsmxv]\d", re.IGNORECASE)
 # P19/P27/P32/S02 ship domain-neutral corpora (honeypot restraint / privilege
@@ -94,7 +94,7 @@ _ATOMIC_JUDGE_ONLY_TEST_IDS: frozenset[str] = frozenset()
 _STRUCTURAL_JUDGE_EDGE_TEST_IDS: frozenset[str] = frozenset({"V08"})
 # Inspections whose only outbound calls are control-plane hooks and the rubric judge: the
 # customer's agent is never sent a prompt.
-_NO_SUT_CONTACT_TEST_IDS: frozenset[str] = frozenset({"V08"})
+_NO_SUT_CONTACT_TEST_IDS: frozenset[str] = frozenset()
 NO_SUT_CONTACT_TEST_IDS: frozenset[str] = _NO_SUT_CONTACT_TEST_IDS
 
 
@@ -128,12 +128,17 @@ def _validate_folder(folder: Path) -> str:
     prefix = folder.name[0].upper()
     folder_nn = folder.name[1:3]
     test_id_for_check = f"{prefix}{folder_nn}"
-    is_structural_only = test_id_for_check in _STRUCTURAL_ONLY_TEST_IDS
+    # A probe pack asks the agent and is graded by its own rubric (rubric.yaml or
+    # rubric_<outcome>.yaml); the pack loader checks it resolves.
+    ships_probe_pack = (folder / "probes.yaml").is_file()
+    is_structural_only = test_id_for_check in _STRUCTURAL_ONLY_TEST_IDS and not ships_probe_pack
     is_atomic_judge_only = test_id_for_check in _ATOMIC_JUDGE_ONLY_TEST_IDS
     is_judge_edge = test_id_for_check in _STRUCTURAL_JUDGE_EDGE_TEST_IDS
     rubric_artifacts = {"rubric.yaml", "references.yaml"}
 
     for artifact in _REQUIRED_ARTIFACTS:
+        if ships_probe_pack and artifact in rubric_artifacts:
+            continue
         if is_structural_only and artifact in rubric_artifacts:
             path = folder / artifact
             if path.is_file():

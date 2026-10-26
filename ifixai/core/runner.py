@@ -1,16 +1,18 @@
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from copy import copy
 from datetime import datetime, timezone
 from typing import Optional
 
+from ifixai.core.applicability import find_off_purpose, set_aside
 from ifixai.core.concurrency import ConcurrencyGovernor
 from ifixai.core.types import (
     EvaluationPipelineConfig,
     Fixture,
     InspectionCategory,
     InspectionSpec,
+    NotApplicable,
     ProviderCapabilities,
     ProviderConfig,
     TestResult,
@@ -22,11 +24,14 @@ from ifixai.evaluation.analytic_judge import (
     EnsembleAnalyticRubricJudge,
 )
 from ifixai.evaluation.pipeline import EvaluationPipeline
+from ifixai.evaluation.run_stop import RUN_STOP, drop_stopped_task_reports
 from ifixai.harness.consistency import CrossHookValidator
 from ifixai.harness.registry import ALL_SPECS, INSPECTION_REGISTRY
+from ifixai.inspections.probe_pack import execute_inspection
 from ifixai.judge.config import JudgeConfig
 from ifixai.judge.evaluator import EnsembleJudgeEvaluator, JudgeEvaluator
 from ifixai.providers.base import ChatProvider, detect_capabilities
+from ifixai.providers.governance_mixin import GovernanceMixin
 from ifixai.reporting.gap_analysis import identify_gaps
 from ifixai.reporting.grading import score_to_grade
 from ifixai.reporting.scorecard import (
@@ -34,7 +39,6 @@ from ifixai.reporting.scorecard import (
     advisory_inspection_warnings,
     attestation_inspection_warnings,
     b22_determinism_warning,
-    b32_not_applicable_warning,
     exploratory_inspection_warnings,
     extraction_error_warnings,
     insufficient_evidence_warnings,
@@ -60,10 +64,8 @@ from ifixai.scoring.mandatory_minimums import (
 )
 
 ProgressCallback = Callable[[str, int, int, "TestResult"], None]
-
-
-class SelfJudgeNotAllowedError(Exception):
-    pass
+# Told once, before any inspection runs, everything the run sets aside (with why).
+SetAsideCallback = Callable[[list[NotApplicable]], None]
 
 
 SPECIFICATION_VERSION = "3.0"
@@ -111,6 +113,7 @@ async def run_all(
     governor: ConcurrencyGovernor | None = None,
     capabilities: ProviderCapabilities | None = None,
     cached_results: dict[str, TestResult] | None = None,
+    on_set_aside: SetAsideCallback | None = None,
 ) -> TestRunResult:
 
     if capabilities is None:
@@ -121,9 +124,14 @@ async def run_all(
     pipeline = _build_pipeline(
         pipeline_config, judge, sut_model=config.model, sut_provider=config.provider
     )
+    # Every call of the run, in every phase and inspection task, checks the run's stop.
+    run_stop = RUN_STOP.set(pipeline.run_stop if pipeline is not None else None)
 
-    to_run, reused_results = _split_cached(INSPECTION_REGISTRY, cached_results)
     try:
+        runnable, not_applicable = await _set_aside(
+            INSPECTION_REGISTRY, fixture, provider, judge_config, pipeline_config, pipeline, on_set_aside
+        )
+        to_run, reused_results = _split_cached(runnable, cached_results)
         test_results = await _execute_inspections(
             inspections=to_run,
             specs=ALL_SPECS,
@@ -150,11 +158,12 @@ async def run_all(
                 "the unavailable check does not establish consistency."
             )
 
-        if violations:
+        consistency_warnings.extend(v.detail for v in violations)
+        # A contradiction in the fixture's own `governance:` answers is shown, never a cap.
+        if violations and not isinstance(provider, GovernanceMixin):
             test_results, consistency_capped = apply_consistency_cap(
                 test_results, violations
             )
-            consistency_warnings.extend(v.detail for v in violations)
         else:
             consistency_capped = False
 
@@ -165,7 +174,8 @@ async def run_all(
             fixture_name=fixture.metadata.name,
             provider_name=config.provider,
             run_mode="full",
-            judge_stats=judge.get_stats() if judge else None,
+            judge_stats=_judge_stats(judge, pipeline),
+            selected_ids=set(runnable),
             provider_capabilities=capabilities,
             warnings=scorecard_warnings(judge_config, config.provider, config.model),
             consistency_warnings=consistency_warnings,
@@ -174,9 +184,11 @@ async def run_all(
                 provider, config.temperature, config.model, config.endpoint
             ),
             sut_seed=config.seed,
+            not_applicable=not_applicable,
         )
         return result
     finally:
+        RUN_STOP.reset(run_stop)
         await _aclose_judge(judge)
 
 
@@ -192,6 +204,7 @@ async def run_strategic(
     governor: ConcurrencyGovernor | None = None,
     capabilities: ProviderCapabilities | None = None,
     cached_results: dict[str, TestResult] | None = None,
+    on_set_aside: SetAsideCallback | None = None,
 ) -> TestRunResult:
 
     if capabilities is None:
@@ -209,9 +222,14 @@ async def run_strategic(
         if bid in STRATEGIC_TEST_IDS
     }
     strategic_specs = [s for s in ALL_SPECS if s.test_id in STRATEGIC_TEST_IDS]
-    to_run, reused_results = _split_cached(strategic_inspections, cached_results)
 
+    # Every call of the run, in every phase and inspection task, checks the run's stop.
+    run_stop = RUN_STOP.set(pipeline.run_stop if pipeline is not None else None)
     try:
+        runnable, not_applicable = await _set_aside(
+            strategic_inspections, fixture, provider, judge_config, pipeline_config, pipeline, on_set_aside
+        )
+        to_run, reused_results = _split_cached(runnable, cached_results)
         test_results = await _execute_inspections(
             inspections=to_run,
             specs=strategic_specs,
@@ -238,11 +256,12 @@ async def run_strategic(
                 "the unavailable check does not establish consistency."
             )
 
-        if violations:
+        consistency_warnings.extend(v.detail for v in violations)
+        # A contradiction in the fixture's own `governance:` answers is shown, never a cap.
+        if violations and not isinstance(provider, GovernanceMixin):
             test_results, consistency_capped = apply_consistency_cap(
                 test_results, violations
             )
-            consistency_warnings.extend(v.detail for v in violations)
         else:
             consistency_capped = False
 
@@ -253,8 +272,8 @@ async def run_strategic(
             fixture_name=fixture.metadata.name,
             provider_name=config.provider,
             run_mode="strategic",
-            judge_stats=judge.get_stats() if judge else None,
-            selected_ids=set(STRATEGIC_TEST_IDS),
+            judge_stats=_judge_stats(judge, pipeline),
+            selected_ids=set(runnable),
             provider_capabilities=capabilities,
             warnings=scorecard_warnings(judge_config, config.provider, config.model),
             consistency_warnings=consistency_warnings,
@@ -263,9 +282,11 @@ async def run_strategic(
                 provider, config.temperature, config.model, config.endpoint
             ),
             sut_seed=config.seed,
+            not_applicable=not_applicable,
         )
         return result
     finally:
+        RUN_STOP.reset(run_stop)
         await _aclose_judge(judge)
 
 
@@ -282,6 +303,7 @@ async def run_selected(
     governor: ConcurrencyGovernor | None = None,
     capabilities: ProviderCapabilities | None = None,
     cached_results: dict[str, TestResult] | None = None,
+    on_set_aside: SetAsideCallback | None = None,
 ) -> TestRunResult:
     """Run an explicit subset of inspections by test id.
 
@@ -312,9 +334,14 @@ async def run_selected(
         if bid in test_ids
     }
     selected_specs = [s for s in ALL_SPECS if s.test_id in test_ids]
-    to_run, reused_results = _split_cached(selected_inspections, cached_results)
 
+    # Every call of the run, in every phase and inspection task, checks the run's stop.
+    run_stop = RUN_STOP.set(pipeline.run_stop if pipeline is not None else None)
     try:
+        runnable, not_applicable = await _set_aside(
+            selected_inspections, fixture, provider, judge_config, pipeline_config, pipeline, on_set_aside
+        )
+        to_run, reused_results = _split_cached(runnable, cached_results)
         test_results = await _execute_inspections(
             inspections=to_run,
             specs=selected_specs,
@@ -341,11 +368,12 @@ async def run_selected(
                 "the unavailable check does not establish consistency."
             )
 
-        if violations:
+        consistency_warnings.extend(v.detail for v in violations)
+        # A contradiction in the fixture's own `governance:` answers is shown, never a cap.
+        if violations and not isinstance(provider, GovernanceMixin):
             test_results, consistency_capped = apply_consistency_cap(
                 test_results, violations
             )
-            consistency_warnings.extend(v.detail for v in violations)
         else:
             consistency_capped = False
 
@@ -356,8 +384,8 @@ async def run_selected(
             fixture_name=fixture.metadata.name,
             provider_name=config.provider,
             run_mode="selected",
-            judge_stats=judge.get_stats() if judge else None,
-            selected_ids=set(test_ids),
+            judge_stats=_judge_stats(judge, pipeline),
+            selected_ids=set(runnable),
             provider_capabilities=capabilities,
             warnings=scorecard_warnings(judge_config, config.provider, config.model),
             consistency_warnings=consistency_warnings,
@@ -366,9 +394,11 @@ async def run_selected(
                 provider, config.temperature, config.model, config.endpoint
             ),
             sut_seed=config.seed,
+            not_applicable=not_applicable,
         )
         return result
     finally:
+        RUN_STOP.reset(run_stop)
         await _aclose_judge(judge)
 
 
@@ -400,9 +430,17 @@ async def run_single(
     pipeline = _build_pipeline(
         pipeline_config, judge, sut_model=config.model, sut_provider=config.provider
     )
+    # Every call of the run, in every phase and inspection task, checks the run's stop.
+    run_stop = RUN_STOP.set(pipeline.run_stop if pipeline is not None else None)
 
     try:
-        return await inspection.execute(
+        _, not_applicable = await _set_aside(
+            {test_id: inspection}, fixture, provider, judge_config, pipeline_config, pipeline
+        )
+        if not_applicable:
+            raise ValueError(f"{test_id} is not applicable: {not_applicable[0].reason}")
+        return await execute_inspection(
+            inspection,
             provider,
             config,
             fixture,
@@ -411,7 +449,33 @@ async def run_single(
             pipeline=pipeline,
         )
     finally:
+        RUN_STOP.reset(run_stop)
         await _aclose_judge(judge)
+
+
+async def _set_aside(
+    inspections: dict[str, object],
+    fixture: Fixture,
+    provider: ChatProvider,
+    judge_config: JudgeConfig | None,
+    pipeline_config: EvaluationPipelineConfig | None,
+    pipeline: EvaluationPipeline | None,
+    on_set_aside: SetAsideCallback | None = None,
+) -> tuple[dict[str, object], list[NotApplicable]]:
+    """The one place every run entry point, single runs included, sets inspections aside:
+    what `set_aside` rules out (the CLI's pre-run list), then the work the fixture's stated
+    purpose leaves out. The mandatory gate is given only the runnable ones."""
+    not_applicable = set_aside(inspections, fixture, provider, judge_config, pipeline_config)
+    skipped = {item.test_id for item in not_applicable}
+    runnable = {tid: i for tid, i in inspections.items() if tid not in skipped}
+    if pipeline is not None:
+        off_purpose = await find_off_purpose(runnable, fixture, pipeline)
+        skipped = {item.test_id for item in off_purpose}
+        runnable = {tid: i for tid, i in runnable.items() if tid not in skipped}
+        not_applicable = not_applicable + off_purpose
+    if on_set_aside is not None:
+        on_set_aside(not_applicable)
+    return runnable, not_applicable
 
 
 def _split_cached(
@@ -474,14 +538,19 @@ def build_partial_result(
     run_mode: str,
     sut_temperature: float | None = 0.0,
     sut_seed: int | None = None,
+    not_applicable: Sequence[NotApplicable] = (),
+    not_run_reason: str = "aborted",
 ) -> TestRunResult:
     """Scorecard for whatever finished before an aborted run stopped.
 
-    Marked `partial` and never PASS: missing mandatory inspections read as
-    unevaluated gate failures, and the warning below says exactly what did
-    not run. The point is to not discard paid-for results on abort.
+    Marked `partial` and never PASS: a mandatory inspection that never ran is
+    a gate not checked, never a fail, and the warning below says exactly what
+    did not run, labelled with `not_run_reason`. The point is to not discard
+    paid-for results on abort.
     """
     abort_reason = _summarize_abort_reason(abort_reason)
+    completed_ids = {r.test_id for r in completed}
+    missing = [tid for tid in planned_ids if tid not in completed_ids]
     result = _build_result(
         test_results=sorted(completed, key=lambda r: r.test_id),
         system_name=system_name,
@@ -491,13 +560,18 @@ def build_partial_result(
         run_mode=run_mode,
         sut_temperature=sut_temperature,
         sut_seed=sut_seed,
+        # A scoped run reports unselected mandatory minimums as not run, the same as when it
+        # completes. A planned one an abort left missing still fails; one a run stop kept from
+        # running (budget, the judge's key or credit) is a gate not checked, never a fail.
+        selected_ids=None if run_mode == "full" else set(planned_ids),
+        not_applicable=not_applicable,
+        not_run_ids=missing if not_run_reason != "aborted" else (),
     )
     result.partial = True
     result.abort_reason = abort_reason
     result.passed = False
-    completed_ids = {r.test_id for r in completed}
-    missing = [tid for tid in planned_ids if tid not in completed_ids]
     result.not_run_test_ids = missing
+    result.not_run_reason = not_run_reason
     if len(missing) > 10:
         missing_label = f"{', '.join(missing[:10])} and {len(missing) - 10} more"
     else:
@@ -506,7 +580,7 @@ def build_partial_result(
         0,
         f"PARTIAL RUN — aborted before completion: {abort_reason}. "
         f"{len(completed_ids)} of {len(planned_ids)} inspections completed; "
-        f"not run: {missing_label}. Scores reflect only what ran and are not "
+        f"not run ({not_run_reason}): {missing_label}. Scores reflect only what ran and are not "
         "comparable to a full run.",
     )
     return result
@@ -524,6 +598,7 @@ async def _execute_inspections(
     pipeline: EvaluationPipeline | None = None,
     governor: ConcurrencyGovernor | None = None,
 ) -> list[TestResult]:
+    drop_stopped_task_reports(asyncio.get_running_loop())
     if governor is None or governor.is_sequential:
         return await _run_sequential(
             inspections,
@@ -569,14 +644,15 @@ async def _run_sequential(
         spec = spec_map.get(test_id)
         try:
             inspection = copy(inspection)
-            result = await inspection.execute(
+            result = await execute_inspection(
+                inspection,
                 provider,
                 config,
                 fixture,
                 capabilities,
                 pipeline_config=pipeline_config,
                 pipeline=pipeline,
-            )  # type: ignore[union-attr]
+            )
         except _EXPECTED_INSPECTION_ERRORS as exc:
             _logger.exception(
                 "Inspection %s failed during sequential execution", test_id
@@ -617,7 +693,8 @@ async def _execute_single_inspection(
     async with governor.acquire():
         try:
             inspection = copy(inspection)
-            return await inspection.execute(  # type: ignore[union-attr]
+            return await execute_inspection(
+                inspection,
                 provider,
                 config,
                 fixture,
@@ -691,6 +768,19 @@ async def _run_parallel(
     return results
 
 
+def _judge_stats(
+    judge: JudgeEvaluator | EnsembleJudgeEvaluator | None,
+    pipeline: EvaluationPipeline | None,
+) -> dict[str, object] | None:
+    """The judge's own call counts, with the cap the pipeline held them to."""
+    if judge is None:
+        return None
+    stats = judge.get_stats()
+    if pipeline is not None:
+        stats.update(pipeline.cap_stats())
+    return stats
+
+
 def _build_judge_evaluator(
     judge_config: JudgeConfig | None,
 ) -> JudgeEvaluator | EnsembleJudgeEvaluator | None:
@@ -746,6 +836,8 @@ def _build_result(
     sut_temperature: float | None = 0.0,
     sut_seed: int | None = None,
     selected_ids: set[str] | None = None,
+    not_applicable: Sequence[NotApplicable] = (),
+    not_run_ids: Sequence[str] = (),
 ) -> TestRunResult:
 
     test_weights = {spec.test_id: spec.weight for spec in ALL_SPECS}
@@ -759,7 +851,12 @@ def _build_result(
 
     raw_overall = compute_overall_score(category_scores, GRADED_CATEGORY_WEIGHTS)
 
-    minimums_result = check_mandatory_minimums(test_results, selected_ids)
+    minimums_result = check_mandatory_minimums(
+        test_results,
+        selected_ids,
+        not_applicable_ids={item.test_id for item in not_applicable if item.kind == "agent"},
+        unchecked_ids={item.test_id for item in not_applicable if item.kind == "run"} | set(not_run_ids),
+    )
     minimums_passed = minimums_result["minimums_passed"]
     minimum_status = minimums_result["minimum_status"]
     overall_score = cap_score_if_minimums_failed(
@@ -819,9 +916,6 @@ def _build_result(
     b22_msg = b22_determinism_warning(test_results, sut_temperature, sut_seed)
     if b22_msg is not None and b22_msg not in seen:
         combined_warnings.append(b22_msg)
-    b32_msg = b32_not_applicable_warning(test_results)
-    if b32_msg is not None and b32_msg not in seen:
-        combined_warnings.append(b32_msg)
 
     # A run that never exercised the safety gate cannot report PASS, however
     # well the inspections it did run scored. The score stays the honest
@@ -859,11 +953,5 @@ def _build_result(
         judge_stats=judge_stats,
         warnings=combined_warnings,
         validation_warnings=list(consistency_warnings) if consistency_warnings else [],
+        not_applicable=list(not_applicable),
     )
-
-
-def _find_spec(test_id: str, specs: list[InspectionSpec]) -> InspectionSpec | None:
-    for spec in specs:
-        if spec.test_id == test_id:
-            return spec
-    return None

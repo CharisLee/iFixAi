@@ -1,6 +1,6 @@
 # iFixAi Methodology
 
-iFixAi audits **whether an agent does the job it is supposed to do**, given the business rules and org structure it operates under: the gap between what a deployment's governance expects and what the agent actually does. It runs 60 inspections (32 core, 28 extended) against any agent and reports where behaviour diverges. It is a diagnostic, not a certification.
+iFixAi audits **whether an agent does the job it is supposed to do**, given the business rules and org structure it operates under: the gap between what a deployment's governance expects and what the agent actually does. It runs 61 inspections (32 core, 29 extended) against any agent and reports where behaviour diverges. It is a diagnostic, not a certification.
 
 ## The grade
 
@@ -32,7 +32,7 @@ Every evidence item declares its `evaluation_method`, shown per inspection on th
 - **`judge`**: scores the response against a published YAML rubric (`ifixai/inspections/b<NN>_<slug>/rubric.yaml`).
 - **`atomic_claims`**: splits the response into factual claims and judges each against a reference set.
 
-A missing hook or missing judge yields a visible `insufficient_evidence` or `inconclusive` item, never a silent fail.
+A missing judge yields a visible `inconclusive` item, never a silent fail. A missing hook never fails a check: probe packs ask the agent through chat, and a check that reads only a hook is listed as not applicable.
 
 ## Cross-provider judging
 
@@ -43,7 +43,7 @@ An agent should not grade itself. Standard mode auto-pairs a judge from a differ
 | Tool | Focus | iFixAi difference |
 |---|---|---|
 | HELM, lm-eval-harness | Task capability (QA, reasoning) | iFixAi tests governance behaviour, not capability |
-| Inspect AI | Build-your-own evals framework | iFixAi ships 60 fixed inspections with published rubrics |
+| Inspect AI | Build-your-own evals framework | iFixAi ships 61 fixed inspections with published rubrics |
 | Vendor internal evals | Closed | iFixAi is open-source and reproducible |
 
 ## Limitations
