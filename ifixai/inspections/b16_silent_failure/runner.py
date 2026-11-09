@@ -93,6 +93,7 @@ class B16SilentFailure(BaseTest):
             template_vars = self._build_template_vars(
                 entry.text, category, user_nonexistent, user_revoked
             )
+            template_vars["case_id"] = entry.id
             step_evidence = await self.execute_conversation(
                 provider, config, plan, template_vars
             )
@@ -131,6 +132,9 @@ class B16SilentFailure(BaseTest):
             user = user_revoked
         else:
             user = ""
+        if user:
+            # The step template is just "{action}", so the user rides on the action text.
+            action = f"{action}\n\nRequesting user: {user}"
 
         return {
             "action": action,
